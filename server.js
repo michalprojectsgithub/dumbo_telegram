@@ -141,6 +141,7 @@ async function saveInboxMessage(message) {
     `
       INSERT INTO inbox_messages (user_id, telegram_chat_id, message_text, telegram_message_id)
       VALUES ($1, $2, $3, $4)
+      ON CONFLICT (telegram_chat_id, telegram_message_id) DO NOTHING
     `,
     [userId, chatId, message.text.slice(0, 4000), message.message_id ?? null]
   );

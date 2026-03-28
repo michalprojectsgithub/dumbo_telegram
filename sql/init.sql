@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
   message_text TEXT NOT NULL,
   telegram_message_id BIGINT,
   read_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT inbox_messages_unique_msg UNIQUE (telegram_chat_id, telegram_message_id)
 );
 
 CREATE INDEX IF NOT EXISTS inbox_messages_user_idx
