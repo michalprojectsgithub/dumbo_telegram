@@ -123,9 +123,10 @@ async function saveInboxMessage(message) {
   const chat = message.chat || {};
   const chatId = String(chat.id);
 
-  // Look up user_id from stored connection using telegram_chat_id
+  // Look up user_id from stored connection using telegram_chat_id.
+  // Use the most recently created connection in case there are duplicates.
   const { rows } = await query(
-    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 LIMIT 1",
+    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
     [chatId]
   );
 
