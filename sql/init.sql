@@ -19,3 +19,16 @@ CREATE TABLE IF NOT EXISTS reminders (
 
 CREATE INDEX IF NOT EXISTS reminders_due_idx
   ON reminders (status, scheduled_at);
+
+CREATE TABLE IF NOT EXISTS inbox_messages (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  telegram_chat_id TEXT NOT NULL,
+  message_text TEXT NOT NULL,
+  telegram_message_id BIGINT,
+  read_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS inbox_messages_user_idx
+  ON inbox_messages (user_id, created_at DESC);

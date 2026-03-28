@@ -119,20 +119,52 @@ async function handleStartCommand(message) {
   await sendTelegramMessage(chat.id, "Connected. I can send you reminders now.");
 }
 
+async function saveInboxMessage(message) {
+  const chat = message.chat || {};
+  const chatId = String(chat.id);
+
+  // Look up user_id from stored connection using telegram_chat_id
+  const { rows } = await query(
+    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 LIMIT 1",
+    [chatId]
+  );
+
+  if (rows.length === 0) {
+    // No connected user for this chat — silently discard
+    return;
+  }
+
+  const userId = rows[0].user_id;
+
+  await query(
+    `
+      INSERT INTO inbox_messages (user_id, telegram_chat_id, message_text, telegram_message_id)
+      VALUES ($1, $2, $3, $4)
+    `,
+    [userId, chatId, message.text.slice(0, 4000), message.message_id ?? null]
+  );
+}
+
 async function processTelegramUpdate(update) {
   const message = update?.message;
   if (!message?.text) {
     return;
   }
 
-  if (!message.text.startsWith("/start")) {
+  if (message.text.startsWith("/start")) {
+    try {
+      await handleStartCommand(message);
+    } catch (error) {
+      console.error("Failed processing /start command:", error);
+    }
     return;
   }
 
+  // Any other message goes to the user's inbox
   try {
-    await handleStartCommand(message);
+    await saveInboxMessage(message);
   } catch (error) {
-    console.error("Failed processing /start command:", error);
+    console.error("Failed saving inbox message:", error);
   }
 }
 
@@ -275,6 +307,91 @@ app.post("/reminders", async (req, res) => {
       ok: false,
       error: "Failed to create reminder."
     });
+  }
+});
+
+// Returns inbox messages for a user, newest first.
+// Optional query param: ?unread=true to return only unread messages.
+app.get("/inbox/:userId", async (req, res) => {
+  const userId = req.params.userId?.trim();
+
+  if (!isValidUserId(userId)) {
+    return res.status(400).json({ ok: false, error: "Invalid userId." });
+  }
+
+  const unreadOnly = req.query.unread === "true";
+
+  try {
+    const { rows } = await query(
+      `
+        SELECT id, user_id, message_text, telegram_message_id, read_at, created_at
+        FROM inbox_messages
+        WHERE user_id = $1
+          ${unreadOnly ? "AND read_at IS NULL" : ""}
+        ORDER BY created_at DESC
+        LIMIT 100
+      `,
+      [userId]
+    );
+
+    return res.json({ ok: true, messages: rows });
+  } catch (error) {
+    console.error("Failed to fetch inbox:", error);
+    return res.status(500).json({ ok: false, error: "Failed to fetch inbox." });
+  }
+});
+
+// Mark a single inbox message as read.
+app.post("/inbox/:messageId/read", async (req, res) => {
+  const messageId = Number(req.params.messageId);
+
+  if (!Number.isInteger(messageId) || messageId <= 0) {
+    return res.status(400).json({ ok: false, error: "Invalid messageId." });
+  }
+
+  try {
+    const { rowCount } = await query(
+      `
+        UPDATE inbox_messages
+        SET read_at = NOW()
+        WHERE id = $1 AND read_at IS NULL
+      `,
+      [messageId]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Message not found or already read." });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Failed to mark message as read:", error);
+    return res.status(500).json({ ok: false, error: "Failed to mark message as read." });
+  }
+});
+
+// Mark all inbox messages as read for a user.
+app.post("/inbox/:userId/read-all", async (req, res) => {
+  const userId = req.params.userId?.trim();
+
+  if (!isValidUserId(userId)) {
+    return res.status(400).json({ ok: false, error: "Invalid userId." });
+  }
+
+  try {
+    const { rowCount } = await query(
+      `
+        UPDATE inbox_messages
+        SET read_at = NOW()
+        WHERE user_id = $1 AND read_at IS NULL
+      `,
+      [userId]
+    );
+
+    return res.json({ ok: true, markedRead: rowCount });
+  } catch (error) {
+    console.error("Failed to mark all messages as read:", error);
+    return res.status(500).json({ ok: false, error: "Failed to mark all messages as read." });
   }
 });
 
