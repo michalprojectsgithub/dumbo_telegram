@@ -38,6 +38,15 @@ CREATE INDEX IF NOT EXISTS inbox_messages_user_idx
 -- Safe to run on existing DB: ADD COLUMN IF NOT EXISTS is a no-op when column already exists.
 ALTER TABLE reminders ADD COLUMN IF NOT EXISTS remote_task_event_id BIGINT;
 
+-- Stores the Telegram message_id that triggered a timer/reminder, used for deduplication.
+ALTER TABLE reminders ADD COLUMN IF NOT EXISTS source_telegram_message_id BIGINT;
+
+-- Partial unique index: prevents duplicate timers from the same Telegram message.
+-- Only enforced when source_telegram_message_id is set (not null).
+CREATE UNIQUE INDEX IF NOT EXISTS reminders_source_msg_idx
+  ON reminders (source_telegram_message_id)
+  WHERE source_telegram_message_id IS NOT NULL;
+
 -- Intake table for tasks created via Telegram bot commands.
 -- The desktop app polls this table and imports events as local tasks, then marks them processed.
 CREATE TABLE IF NOT EXISTS remote_task_events (

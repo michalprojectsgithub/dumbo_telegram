@@ -60,6 +60,63 @@ function sanitizeErrorMessage(error) {
   return message.slice(0, 1000);
 }
 
+// Returns the raw input after stripping "timer " or "/timer " prefix, otherwise null.
+function parseTimerPrefix(text) {
+  const trimmed = text.trim();
+  if (/^\/timer\s+/i.test(trimmed)) return trimmed.replace(/^\/timer\s+/i, "").trim();
+  if (/^timer\s+/i.test(trimmed)) return trimmed.replace(/^timer\s+/i, "").trim();
+  return null;
+}
+
+// Parses a duration + optional label from timer input.
+// Supports: 20m, 20 min, 20 minutes, 1h, 2 hours, 90s, 45 sec, 1h30m, 1h 30m, 1d
+// Returns { durationSeconds, label } or null if no valid duration found.
+function parseTimerInput(rawInput) {
+  const trimmed = rawInput.trim();
+
+  // Match one or more adjacent duration segments at the start of the string
+  const durationRegex = /^((?:\d+\s*(?:d(?:ays?)?|h(?:(?:ou)?rs?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?)\s*)+)/i;
+  const durationMatch = trimmed.match(durationRegex);
+
+  if (!durationMatch) return null;
+
+  const durationStr = durationMatch[1].trim();
+  const label = trimmed.slice(durationMatch[1].length).trim() || null;
+
+  let totalSeconds = 0;
+  const segmentRegex = /(\d+)\s*(d(?:ays?)?|h(?:(?:ou)?rs?)?|m(?:in(?:utes?)?)?|s(?:ec(?:onds?)?)?)/gi;
+  let seg;
+
+  while ((seg = segmentRegex.exec(durationStr)) !== null) {
+    const val = parseInt(seg[1], 10);
+    const unit = seg[2][0].toLowerCase(); // first char: d, h, m, s
+    if (unit === "d") totalSeconds += val * 86400;
+    else if (unit === "h") totalSeconds += val * 3600;
+    else if (unit === "m") totalSeconds += val * 60;
+    else if (unit === "s") totalSeconds += val;
+  }
+
+  if (totalSeconds <= 0) return null;
+
+  return { durationSeconds: totalSeconds, label };
+}
+
+// Converts a duration in seconds to a human-readable string like "1 hour 30 minutes".
+function formatDuration(seconds) {
+  const parts = [];
+  const d = Math.floor(seconds / 86400);
+  const h = Math.floor((seconds % 86400) / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = seconds % 60;
+
+  if (d > 0) parts.push(`${d} day${d !== 1 ? "s" : ""}`);
+  if (h > 0) parts.push(`${h} hour${h !== 1 ? "s" : ""}`);
+  if (m > 0) parts.push(`${m} minute${m !== 1 ? "s" : ""}`);
+  if (s > 0) parts.push(`${s} second${s !== 1 ? "s" : ""}`);
+
+  return parts.join(" ") || "0 seconds";
+}
+
 // Returns the raw task input string if the message is a task command, otherwise null.
 // Handles both "task ..." and "/task ..." prefixes (case-insensitive).
 function parseTaskPrefix(text) {
@@ -152,6 +209,66 @@ async function handleStartCommand(message) {
   );
 
   await sendTelegramMessage(chat.id, "Connected. I can send you reminders now.");
+}
+
+async function handleTimerCommand(message, rawInput) {
+  const chat = message.chat || {};
+  const chatId = String(chat.id);
+  const telegramMessageId = message.message_id ?? null;
+
+  const parsed = parseTimerInput(rawInput);
+  if (!parsed) {
+    console.log(`[timer] parse failed for input: "${rawInput}"`);
+    await sendTelegramMessage(chatId, "Could not parse timer. Example: timer 20m tea");
+    return;
+  }
+
+  const { durationSeconds, label } = parsed;
+
+  // Look up user_id for this chat
+  const { rows: connRows } = await query(
+    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [chatId]
+  );
+
+  if (connRows.length === 0) {
+    await sendTelegramMessage(chatId, "You are not connected. Please send /start <your-user-id> first.");
+    return;
+  }
+
+  const userId = connRows[0].user_id;
+  const scheduledAt = new Date(Date.now() + durationSeconds * 1000);
+  const messageText = label ? `⏰ Timer finished: ${label}` : "⏰ Timer finished.";
+
+  console.log(`[timer] user=${userId} duration=${durationSeconds}s label="${label ?? ""}" scheduledAt=${scheduledAt.toISOString()}`);
+
+  // Insert into existing reminders table — the existing processDueReminders worker delivers it.
+  // ON CONFLICT on source_telegram_message_id prevents duplicate timers from duplicate updates.
+  const { rows } = await query(
+    `
+      INSERT INTO reminders (user_id, message_text, scheduled_at, status, source_telegram_message_id)
+      VALUES ($1, $2, $3, 'pending', $4)
+      ON CONFLICT (source_telegram_message_id)
+        WHERE source_telegram_message_id IS NOT NULL
+      DO NOTHING
+      RETURNING id
+    `,
+    [userId, messageText, scheduledAt.toISOString(), telegramMessageId]
+  );
+
+  if (rows.length === 0) {
+    console.log(`[timer] duplicate telegram_message_id=${telegramMessageId}, skipped`);
+    return;
+  }
+
+  console.log(`[timer] reminder created: id=${rows[0].id}`);
+
+  const durationLabel = formatDuration(durationSeconds);
+  const confirmText = label
+    ? `Timer set for ${durationLabel}: ${label}`
+    : `Timer set for ${durationLabel}.`;
+
+  await sendTelegramMessage(chatId, confirmText);
 }
 
 async function handleTaskCommand(message, rawInput) {
@@ -278,6 +395,21 @@ async function processTelegramUpdate(update) {
       await handleStartCommand(message);
     } catch (error) {
       console.error("Failed processing /start command:", error);
+    }
+    return;
+  }
+
+  const timerInput = parseTimerPrefix(message.text);
+  if (timerInput !== null) {
+    try {
+      await handleTimerCommand(message, timerInput);
+    } catch (error) {
+      console.error("Failed processing timer command:", error);
+      try {
+        await sendTelegramMessage(String(message.chat?.id), "Sorry, failed to set that timer. Please try again.");
+      } catch {
+        // ignore secondary failure
+      }
     }
     return;
   }
