@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   user_id TEXT NOT NULL,
   message_text TEXT NOT NULL,
   scheduled_at TIMESTAMPTZ NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sent', 'failed')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'sending', 'sent', 'failed')),
   sent_at TIMESTAMPTZ,
   error_message TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()

@@ -471,52 +471,51 @@ async function processDueReminders() {
 
   workerInProgress = true;
   try {
+    // Atomically claim a batch of due reminders by moving them to 'sending'.
+    // FOR UPDATE SKIP LOCKED means two concurrent server instances will never
+    // claim the same row, eliminating duplicate Telegram message delivery.
     const { rows } = await query(
       `
-        SELECT
-          r.id,
-          r.user_id,
-          r.message_text,
-          tc.telegram_chat_id
-        FROM reminders r
-        LEFT JOIN telegram_connections tc ON tc.user_id = r.user_id
-        WHERE r.status = 'pending' AND r.scheduled_at <= NOW()
-        ORDER BY r.scheduled_at ASC
-        LIMIT 20
+        WITH claimed AS (
+          SELECT id FROM reminders
+          WHERE status = 'pending' AND scheduled_at <= NOW()
+          ORDER BY scheduled_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE reminders
+        SET status = 'sending'
+        FROM claimed
+        WHERE reminders.id = claimed.id
+        RETURNING reminders.id, reminders.user_id, reminders.message_text
       `
     );
 
     for (const reminder of rows) {
-      if (!reminder.telegram_chat_id) {
+      // Look up telegram_chat_id for this user
+      const { rows: connRows } = await query(
+        "SELECT telegram_chat_id FROM telegram_connections WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [reminder.user_id]
+      );
+
+      if (!connRows[0]?.telegram_chat_id) {
         await query(
-          `
-            UPDATE reminders
-            SET status = 'failed', error_message = $2
-            WHERE id = $1
-          `,
+          "UPDATE reminders SET status = 'failed', error_message = $2 WHERE id = $1",
           [reminder.id, "No Telegram connection for user_id"]
         );
         continue;
       }
 
       try {
-        await sendTelegramMessage(reminder.telegram_chat_id, reminder.message_text);
+        await sendTelegramMessage(connRows[0].telegram_chat_id, reminder.message_text);
         await query(
-          `
-            UPDATE reminders
-            SET status = 'sent', sent_at = NOW(), error_message = NULL
-            WHERE id = $1
-          `,
+          "UPDATE reminders SET status = 'sent', sent_at = NOW(), error_message = NULL WHERE id = $1",
           [reminder.id]
         );
       } catch (error) {
         console.error(`Failed to send reminder ${reminder.id}:`, error);
         await query(
-          `
-            UPDATE reminders
-            SET status = 'failed', error_message = $2
-            WHERE id = $1
-          `,
+          "UPDATE reminders SET status = 'failed', error_message = $2 WHERE id = $1",
           [reminder.id, sanitizeErrorMessage(error)]
         );
       }
