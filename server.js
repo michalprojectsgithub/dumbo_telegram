@@ -70,13 +70,14 @@ function parseTaskPrefix(text) {
 }
 
 // Extracts an optional due date from natural language input using chrono-node.
-// Returns { title, dueAt } where dueAt is a Date or null.
-// The matched date text is removed from the title.
+// Returns { title, dueAt, dateText } where:
+//   dueAt    - parsed Date object or null
+//   dateText - the original date phrase the user typed (used in confirmation to avoid timezone confusion)
 function extractDueDate(rawInput) {
   const results = chrono.parse(rawInput, new Date(), { forwardDate: true });
 
   if (results.length === 0) {
-    return { title: rawInput.trim(), dueAt: null };
+    return { title: rawInput.trim(), dueAt: null, dateText: null };
   }
 
   const match = results[0];
@@ -89,12 +90,8 @@ function extractDueDate(rawInput) {
   const raw = `${before} ${after}`.trim().replace(/\s+(at|on|in|by|for)$/i, "").trim();
   const title = raw || rawInput.trim();
 
-  return { title, dueAt };
-}
-
-// Formats a Date as a clean readable UTC string for Telegram confirmation messages.
-function formatDueAt(date) {
-  return date.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  // Preserve the original date text the user typed so we can echo it back exactly
+  return { title, dueAt, dateText: match.text };
 }
 
 async function telegramRequest(method, payload) {
@@ -174,7 +171,7 @@ async function handleTaskCommand(message, rawInput) {
   }
 
   const userId = connRows[0].user_id;
-  const { title, dueAt } = extractDueDate(rawInput);
+  const { title, dueAt, dateText } = extractDueDate(rawInput);
 
   console.log(`[task] user=${userId} title="${title}" dueAt=${dueAt?.toISOString() ?? "none"}`);
 
@@ -227,10 +224,10 @@ async function handleTaskCommand(message, rawInput) {
     await client.query("COMMIT");
     console.log(`[task] event created: id=${eventId}`);
 
-    // Send Telegram confirmation
+    // Send Telegram confirmation — echo the user's original date text to avoid UTC confusion
     let confirmText = `Task created: ${title}`;
     if (dueAt) {
-      confirmText += `\nReminder set for: ${formatDueAt(dueAt)}`;
+      confirmText += `\nReminder set for: ${dateText}`;
     }
     await sendTelegramMessage(chatId, confirmText);
 
