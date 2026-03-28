@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import * as chrono from "chrono-node";
 import { pool, query } from "./db.js";
 
 const app = express();
@@ -57,6 +58,43 @@ function parseScheduledAt(value) {
 function sanitizeErrorMessage(error) {
   const message = error instanceof Error ? error.message : "Unknown error";
   return message.slice(0, 1000);
+}
+
+// Returns the raw task input string if the message is a task command, otherwise null.
+// Handles both "task ..." and "/task ..." prefixes (case-insensitive).
+function parseTaskPrefix(text) {
+  const trimmed = text.trim();
+  if (/^\/task\s+/i.test(trimmed)) return trimmed.replace(/^\/task\s+/i, "").trim();
+  if (/^task\s+/i.test(trimmed)) return trimmed.replace(/^task\s+/i, "").trim();
+  return null;
+}
+
+// Extracts an optional due date from natural language input using chrono-node.
+// Returns { title, dueAt } where dueAt is a Date or null.
+// The matched date text is removed from the title.
+function extractDueDate(rawInput) {
+  const results = chrono.parse(rawInput, new Date(), { forwardDate: true });
+
+  if (results.length === 0) {
+    return { title: rawInput.trim(), dueAt: null };
+  }
+
+  const match = results[0];
+  const dueAt = match.date();
+
+  const before = rawInput.slice(0, match.index).trimEnd();
+  const after = rawInput.slice(match.index + match.text.length).trimStart();
+
+  // Remove trailing connectors left behind after stripping the date phrase
+  const raw = `${before} ${after}`.trim().replace(/\s+(at|on|in|by|for)$/i, "").trim();
+  const title = raw || rawInput.trim();
+
+  return { title, dueAt };
+}
+
+// Formats a Date as a clean readable UTC string for Telegram confirmation messages.
+function formatDueAt(date) {
+  return date.toISOString().replace("T", " ").slice(0, 16) + " UTC";
 }
 
 async function telegramRequest(method, payload) {
@@ -119,6 +157,91 @@ async function handleStartCommand(message) {
   await sendTelegramMessage(chat.id, "Connected. I can send you reminders now.");
 }
 
+async function handleTaskCommand(message, rawInput) {
+  const chat = message.chat || {};
+  const chatId = String(chat.id);
+  const telegramMessageId = message.message_id ?? null;
+
+  // Look up the app user_id for this Telegram chat
+  const { rows: connRows } = await query(
+    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [chatId]
+  );
+
+  if (connRows.length === 0) {
+    await sendTelegramMessage(chatId, "You are not connected. Please send /start <your-user-id> first.");
+    return;
+  }
+
+  const userId = connRows[0].user_id;
+  const { title, dueAt } = extractDueDate(rawInput);
+
+  console.log(`[task] user=${userId} title="${title}" dueAt=${dueAt?.toISOString() ?? "none"}`);
+
+  // Use a transaction so task event + reminder are created atomically
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows: eventRows } = await client.query(
+      `
+        INSERT INTO remote_task_events
+          (user_id, telegram_chat_id, telegram_message_id, raw_input, title, due_at)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (telegram_chat_id, telegram_message_id) DO NOTHING
+        RETURNING id
+      `,
+      [userId, chatId, telegramMessageId, rawInput, title, dueAt ?? null]
+    );
+
+    // Conflict means this exact Telegram message was already processed — skip silently
+    if (eventRows.length === 0) {
+      await client.query("ROLLBACK");
+      console.log(`[task] duplicate telegram_message_id=${telegramMessageId}, skipped`);
+      return;
+    }
+
+    const eventId = eventRows[0].id;
+    let reminderId = null;
+
+    if (dueAt) {
+      const { rows: reminderRows } = await client.query(
+        `
+          INSERT INTO reminders (user_id, message_text, scheduled_at, status, remote_task_event_id)
+          VALUES ($1, $2, $3, 'pending', $4)
+          RETURNING id
+        `,
+        [userId, `Reminder: ${title}`, dueAt.toISOString(), eventId]
+      );
+
+      reminderId = reminderRows[0].id;
+
+      await client.query(
+        "UPDATE remote_task_events SET reminder_scheduled = TRUE, reminder_id = $2 WHERE id = $1",
+        [eventId, reminderId]
+      );
+
+      console.log(`[task] reminder scheduled: id=${reminderId} at ${dueAt.toISOString()}`);
+    }
+
+    await client.query("COMMIT");
+    console.log(`[task] event created: id=${eventId}`);
+
+    // Send Telegram confirmation
+    let confirmText = `Task created: ${title}`;
+    if (dueAt) {
+      confirmText += `\nReminder set for: ${formatDueAt(dueAt)}`;
+    }
+    await sendTelegramMessage(chatId, confirmText);
+
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function saveInboxMessage(message) {
   const chat = message.chat || {};
   const chatId = String(chat.id);
@@ -158,6 +281,22 @@ async function processTelegramUpdate(update) {
       await handleStartCommand(message);
     } catch (error) {
       console.error("Failed processing /start command:", error);
+    }
+    return;
+  }
+
+  const taskInput = parseTaskPrefix(message.text);
+  if (taskInput !== null) {
+    try {
+      await handleTaskCommand(message, taskInput);
+    } catch (error) {
+      console.error("Failed processing task command:", error);
+      // Best-effort: try to notify the user something went wrong
+      try {
+        await sendTelegramMessage(String(message.chat?.id), "Sorry, failed to create that task. Please try again.");
+      } catch {
+        // ignore secondary failure
+      }
     }
     return;
   }
@@ -394,6 +533,71 @@ app.post("/inbox/:userId/read-all", async (req, res) => {
   } catch (error) {
     console.error("Failed to mark all messages as read:", error);
     return res.status(500).json({ ok: false, error: "Failed to mark all messages as read." });
+  }
+});
+
+// Returns Telegram-created task events for a user.
+// Optional query param: ?processed=false (default) or ?processed=true or omit for all.
+app.get("/remote-task-events", async (req, res) => {
+  const userId = req.query.userId?.trim();
+
+  if (!isValidUserId(userId)) {
+    return res.status(400).json({ ok: false, error: "Invalid or missing userId query param." });
+  }
+
+  const processedParam = req.query.processed;
+  const conditions = ["user_id = $1"];
+  if (processedParam === "false") conditions.push("processed_by_desktop = FALSE");
+  if (processedParam === "true") conditions.push("processed_by_desktop = TRUE");
+
+  try {
+    const { rows } = await query(
+      `
+        SELECT
+          id, user_id, source, event_type, raw_input, title, due_at,
+          reminder_id, reminder_scheduled,
+          processed_by_desktop, processed_at, created_at
+        FROM remote_task_events
+        WHERE ${conditions.join(" AND ")}
+        ORDER BY created_at DESC
+        LIMIT 100
+      `,
+      [userId]
+    );
+
+    return res.json({ ok: true, events: rows });
+  } catch (error) {
+    console.error("Failed to fetch remote task events:", error);
+    return res.status(500).json({ ok: false, error: "Failed to fetch remote task events." });
+  }
+});
+
+// Desktop app calls this after importing a remote task event into local storage.
+app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
+  const eventId = Number(req.params.id);
+
+  if (!Number.isInteger(eventId) || eventId <= 0) {
+    return res.status(400).json({ ok: false, error: "Invalid event id." });
+  }
+
+  try {
+    const { rowCount } = await query(
+      `
+        UPDATE remote_task_events
+        SET processed_by_desktop = TRUE, processed_at = NOW()
+        WHERE id = $1 AND processed_by_desktop = FALSE
+      `,
+      [eventId]
+    );
+
+    if (rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Event not found or already processed." });
+    }
+
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Failed to mark event as processed:", error);
+    return res.status(500).json({ ok: false, error: "Failed to mark event as processed." });
   }
 });
 
