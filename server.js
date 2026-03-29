@@ -129,13 +129,36 @@ function parseTaskPrefix(text) {
   return null;
 }
 
+const MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+];
+
+// Converts European date formats (DD.MM or DD.MM.YYYY) to English so chrono-node can parse them.
+// e.g. "30.3" → "30 March", "30.3.2026" → "30 March 2026", "5.12.2026" → "5 December 2026"
+// The lookbehind/lookahead prevent matching inside version strings like "v1.2.3".
+function normalizeEuropeanDates(input) {
+  return input.replace(
+    /(?<![.\d])(\d{1,2})\.(\d{1,2})(?:\.(\d{4}|\d{2}))?(?![.\d])/g,
+    (original, day, month, year) => {
+      const monthNum = parseInt(month, 10);
+      const dayNum = parseInt(day, 10);
+      if (monthNum < 1 || monthNum > 12 || dayNum < 1 || dayNum > 31) return original;
+      const monthName = MONTH_NAMES[monthNum - 1];
+      return year ? `${dayNum} ${monthName} ${year}` : `${dayNum} ${monthName}`;
+    }
+  );
+}
+
 // Extracts an optional due date from natural language input using chrono-node.
 // Returns { title, dueAt, dateText } where:
 //   dueAt    - parsed Date object or null
-//   dateText - the original date phrase the user typed (used in confirmation to avoid timezone confusion)
+//   dateText - the date phrase echoed back in confirmation messages
 function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
+  // Normalize European dates before parsing so chrono-node understands them.
+  const normalized = normalizeEuropeanDates(rawInput);
   // Pass the user's per-user timezone offset so "10:00" is interpreted as their local time.
-  const results = chrono.parse(rawInput, { instant: new Date(), timezone: timezoneOffsetMinutes }, { forwardDate: true });
+  const results = chrono.parse(normalized, { instant: new Date(), timezone: timezoneOffsetMinutes }, { forwardDate: true });
 
   if (results.length === 0) {
     return { title: rawInput.trim(), dueAt: null, dateText: null };
@@ -143,8 +166,9 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
 
   const match = results[0];
 
-  const before = rawInput.slice(0, match.index).trimEnd();
-  const after = rawInput.slice(match.index + match.text.length).trimStart();
+  // Slice from the normalized string (match indices are relative to it)
+  const before = normalized.slice(0, match.index).trimEnd();
+  const after = normalized.slice(match.index + match.text.length).trimStart();
 
   // Remove trailing connectors left behind after stripping the date phrase
   const raw = `${before} ${after}`.trim().replace(/\s+(at|on|in|by|for)$/i, "").trim();
