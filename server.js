@@ -12,9 +12,9 @@ const telegramApiBaseUrl = `https://api.telegram.org/bot${telegramBotToken}`;
 const pollingIntervalMs = Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 3000);
 const workerIntervalMs = Number(process.env.REMINDER_WORKER_INTERVAL_MS || 3000);
 const corsOrigin = process.env.CORS_ORIGIN || "*";
-// UTC offset in minutes for the user's local timezone, used when parsing natural language
-// dates from Telegram messages. Example: UTC+2 = 120, UTC-5 = -300. Default: 0 (UTC).
-const userTimezoneOffsetMinutes = Number(process.env.USER_TIMEZONE_OFFSET_MINUTES || 0);
+// Fallback timezone offset used only if a user has not set their own via /timezone.
+// UTC offset in minutes. UTC+2 = 120, UTC-5 = -300. Default: 0 (UTC).
+const defaultTimezoneOffsetMinutes = Number(process.env.USER_TIMEZONE_OFFSET_MINUTES || 0);
 
 if (!telegramBotToken) {
   throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -133,9 +133,9 @@ function parseTaskPrefix(text) {
 // Returns { title, dueAt, dateText } where:
 //   dueAt    - parsed Date object or null
 //   dateText - the original date phrase the user typed (used in confirmation to avoid timezone confusion)
-function extractDueDate(rawInput) {
-  // Pass the user's timezone offset so "10:00" is interpreted as local time, not UTC.
-  const results = chrono.parse(rawInput, { instant: new Date(), timezone: userTimezoneOffsetMinutes }, { forwardDate: true });
+function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
+  // Pass the user's per-user timezone offset so "10:00" is interpreted as their local time.
+  const results = chrono.parse(rawInput, { instant: new Date(), timezone: timezoneOffsetMinutes }, { forwardDate: true });
 
   if (results.length === 0) {
     return { title: rawInput.trim(), dueAt: null, dateText: null };
@@ -215,6 +215,62 @@ async function handleStartCommand(message) {
   await sendTelegramMessage(chat.id, "Connected. I can send you reminders now.");
 }
 
+// Parses "/timezone +2", "/timezone -5", "/timezone 120", "/timezone 0" etc.
+// Returns offset in minutes, or null if unparseable.
+function parseTimezoneInput(text) {
+  const match = text.trim().match(/^([+-]?\d+(?:\.\d+)?)$/);
+  if (!match) return null;
+
+  const value = parseFloat(match[1]);
+
+  // Accept either hours (e.g. +2, -5) or minutes (e.g. 120, -300)
+  // Heuristic: values between -18 and +18 are treated as hours; outside that as minutes
+  const offsetMinutes = Math.abs(value) <= 18
+    ? Math.round(value * 60)
+    : Math.round(value);
+
+  if (offsetMinutes < -840 || offsetMinutes > 840) return null; // outside UTC-14..+14
+  return offsetMinutes;
+}
+
+async function handleTimezoneCommand(message, rawInput) {
+  const chat = message.chat || {};
+  const chatId = String(chat.id);
+
+  const offset = parseTimezoneInput(rawInput);
+  if (offset === null) {
+    await sendTelegramMessage(
+      chatId,
+      "Could not parse timezone.\n" +
+      "Use your UTC offset in hours or minutes:\n" +
+      "  /timezone +2   (UTC+2)\n" +
+      "  /timezone -5   (UTC-5)\n" +
+      "  /timezone 0    (UTC)"
+    );
+    return;
+  }
+
+  const { rows } = await query(
+    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [chatId]
+  );
+
+  if (rows.length === 0) {
+    await sendTelegramMessage(chatId, "You are not connected. Please send /start <your-user-id> first.");
+    return;
+  }
+
+  await query(
+    "UPDATE telegram_connections SET timezone_offset_minutes = $1 WHERE user_id = $2",
+    [offset, rows[0].user_id]
+  );
+
+  const sign = offset >= 0 ? "+" : "";
+  const hours = (offset / 60).toFixed(1).replace(".0", "");
+  await sendTelegramMessage(chatId, `Timezone set to UTC${sign}${hours}. Task times will now be interpreted in your local time.`);
+  console.log(`[timezone] user=${rows[0].user_id} set timezone_offset_minutes=${offset}`);
+}
+
 async function handleTimerCommand(message, rawInput) {
   const chat = message.chat || {};
   const chatId = String(chat.id);
@@ -280,9 +336,9 @@ async function handleTaskCommand(message, rawInput) {
   const chatId = String(chat.id);
   const telegramMessageId = message.message_id ?? null;
 
-  // Look up the app user_id for this Telegram chat
+  // Look up the app user_id and timezone for this Telegram chat
   const { rows: connRows } = await query(
-    "SELECT user_id FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    "SELECT user_id, timezone_offset_minutes FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
     [chatId]
   );
 
@@ -292,7 +348,8 @@ async function handleTaskCommand(message, rawInput) {
   }
 
   const userId = connRows[0].user_id;
-  const { title, dueAt, dateText } = extractDueDate(rawInput);
+  const timezoneOffset = connRows[0].timezone_offset_minutes ?? defaultTimezoneOffsetMinutes;
+  const { title, dueAt, dateText } = extractDueDate(rawInput, timezoneOffset);
 
   console.log(`[task] user=${userId} title="${title}" dueAt=${dueAt?.toISOString() ?? "none"}`);
 
@@ -399,6 +456,16 @@ async function processTelegramUpdate(update) {
       await handleStartCommand(message);
     } catch (error) {
       console.error("Failed processing /start command:", error);
+    }
+    return;
+  }
+
+  if (/^\/timezone\s+/i.test(message.text)) {
+    const tzInput = message.text.replace(/^\/timezone\s+/i, "").trim();
+    try {
+      await handleTimezoneCommand(message, tzInput);
+    } catch (error) {
+      console.error("Failed processing /timezone command:", error);
     }
     return;
   }
