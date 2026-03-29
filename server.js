@@ -216,10 +216,9 @@ async function handleStartCommand(message) {
     chat.id,
     "Connected. I can send you reminders now.\n\n" +
     "Set your timezone so task times are correct:\n" +
-    "  /timezone +1   (Central Europe winter)\n" +
-    "  /timezone +2   (Central Europe summer)\n" +
-    "  /timezone 0    (UTC / UK)\n" +
-    "  /timezone -5   (US Eastern)\n\n" +
+    "  /timezone GMT+2\n" +
+    "  /timezone Europe/Prague\n" +
+    "  /timezone +2\n\n" +
     "Commands:\n" +
     "  task <text> [time]   — create a task\n" +
     "  timer <duration> [label]   — set a timer\n" +
@@ -227,21 +226,81 @@ async function handleStartCommand(message) {
   );
 }
 
-// Parses "/timezone +2", "/timezone -5", "/timezone 120", "/timezone 0" etc.
-// Returns offset in minutes, or null if unparseable.
-function parseTimezoneInput(text) {
-  const match = text.trim().match(/^([+-]?\d+(?:\.\d+)?)$/);
-  if (!match) return null;
+// Parses timezone input into a UTC offset in minutes.
+// Accepts: +2, -5, +5.5, GMT+2, UTC+2, UTC-5, UTC+5:30, CET, EST, Europe/Prague, etc.
+// Returns offset in minutes or null if unparseable.
+function parseTimezoneInput(raw) {
+  const text = raw.trim();
 
-  const value = parseFloat(match[1]);
+  // Named IANA timezone (e.g. "Europe/Prague", "America/New_York")
+  if (/^[A-Za-z_]+\/[A-Za-z_]+/.test(text)) {
+    try {
+      // Get UTC offset by formatting a date in that timezone and reading the offset
+      const now = new Date();
+      const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: text,
+        timeZoneName: "shortOffset"
+      }).formatToParts(now);
+      const offsetStr = parts.find(p => p.type === "timeZoneName")?.value || "";
+      // offsetStr is like "GMT+2", "GMT-5", "GMT+5:30", "GMT"
+      return parseGmtOffsetString(offsetStr);
+    } catch {
+      return null; // invalid IANA name
+    }
+  }
 
-  // Accept either hours (e.g. +2, -5) or minutes (e.g. 120, -300)
-  // Heuristic: values between -18 and +18 are treated as hours; outside that as minutes
+  // GMT+2, UTC+2, UTC-5, UTC+5:30, GMT, UTC
+  if (/^(GMT|UTC)/i.test(text)) {
+    return parseGmtOffsetString(text);
+  }
+
+  // Plain numeric: +2, -5, +5.5, 120, -300
+  const numMatch = text.match(/^([+-]?\d+(?:[.:]\d+)?)$/);
+  if (numMatch) {
+    return numericToOffsetMinutes(numMatch[1]);
+  }
+
+  // Common abbreviations mapped to fixed offsets
+  const abbreviations = {
+    UTC: 0, GMT: 0,
+    WET: 0, CET: 60, CEST: 120, EET: 120, EEST: 180,
+    MSK: 180, IST: 330, CST: -360, EST: -300, EDT: -240,
+    PST: -480, PDT: -420, MST: -420, MDT: -360
+  };
+  const upper = text.toUpperCase();
+  if (Object.hasOwn(abbreviations, upper)) {
+    return abbreviations[upper];
+  }
+
+  return null;
+}
+
+// Parses "GMT+2", "GMT-5", "GMT+5:30", "UTC+2", "GMT" into minutes.
+function parseGmtOffsetString(str) {
+  const clean = str.replace(/^(GMT|UTC)/i, "").trim();
+  if (!clean || clean === "") return 0; // plain "GMT" or "UTC"
+  return numericToOffsetMinutes(clean);
+}
+
+// Converts "+2", "-5", "+5:30", "+5.5", "120" into offset minutes.
+function numericToOffsetMinutes(str) {
+  // Handle HH:MM format like +5:30
+  const colonMatch = str.match(/^([+-]?\d+):(\d+)$/);
+  if (colonMatch) {
+    const hours = parseInt(colonMatch[1], 10);
+    const mins = parseInt(colonMatch[2], 10);
+    return hours * 60 + (hours < 0 ? -mins : mins);
+  }
+
+  const value = parseFloat(str);
+  if (Number.isNaN(value)) return null;
+
+  // Values -18 to +18 treated as hours; outside that as minutes
   const offsetMinutes = Math.abs(value) <= 18
     ? Math.round(value * 60)
     : Math.round(value);
 
-  if (offsetMinutes < -840 || offsetMinutes > 840) return null; // outside UTC-14..+14
+  if (offsetMinutes < -840 || offsetMinutes > 840) return null;
   return offsetMinutes;
 }
 
@@ -254,13 +313,14 @@ async function handleTimezoneCommand(message, rawInput) {
     await sendTelegramMessage(
       chatId,
       "Could not parse that timezone.\n\n" +
-      "Send your UTC offset as hours:\n" +
-      "  /timezone +2   → UTC+2 (e.g. Central Europe summer)\n" +
-      "  /timezone +1   → UTC+1 (e.g. Central Europe winter)\n" +
-      "  /timezone 0    → UTC (e.g. UK)\n" +
-      "  /timezone -5   → UTC-5 (e.g. US Eastern)\n" +
-      "  /timezone +5.5 → UTC+5:30 (e.g. India)\n\n" +
-      "Find your offset at: worldtimeserver.com"
+      "Accepted formats:\n" +
+      "  /timezone +2\n" +
+      "  /timezone GMT+2\n" +
+      "  /timezone UTC+2\n" +
+      "  /timezone Europe/Prague\n" +
+      "  /timezone America/New_York\n" +
+      "  /timezone CET\n\n" +
+      "Find your timezone name at: worldtimeserver.com"
     );
     return;
   }
