@@ -12,6 +12,9 @@ const telegramApiBaseUrl = `https://api.telegram.org/bot${telegramBotToken}`;
 const pollingIntervalMs = Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 3000);
 const workerIntervalMs = Number(process.env.REMINDER_WORKER_INTERVAL_MS || 3000);
 const corsOrigin = process.env.CORS_ORIGIN || "*";
+// UTC offset in minutes for the user's local timezone, used when parsing natural language
+// dates from Telegram messages. Example: UTC+2 = 120, UTC-5 = -300. Default: 0 (UTC).
+const userTimezoneOffsetMinutes = Number(process.env.USER_TIMEZONE_OFFSET_MINUTES || 0);
 
 if (!telegramBotToken) {
   throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -131,7 +134,8 @@ function parseTaskPrefix(text) {
 //   dueAt    - parsed Date object or null
 //   dateText - the original date phrase the user typed (used in confirmation to avoid timezone confusion)
 function extractDueDate(rawInput) {
-  const results = chrono.parse(rawInput, new Date(), { forwardDate: true });
+  // Pass the user's timezone offset so "10:00" is interpreted as local time, not UTC.
+  const results = chrono.parse(rawInput, { instant: new Date(), timezone: userTimezoneOffsetMinutes }, { forwardDate: true });
 
   if (results.length === 0) {
     return { title: rawInput.trim(), dueAt: null, dateText: null };
