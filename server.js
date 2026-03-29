@@ -212,7 +212,19 @@ async function handleStartCommand(message) {
     [resolvedUserId, String(chat.id), telegramUsername]
   );
 
-  await sendTelegramMessage(chat.id, "Connected. I can send you reminders now.");
+  await sendTelegramMessage(
+    chat.id,
+    "Connected. I can send you reminders now.\n\n" +
+    "Set your timezone so task times are correct:\n" +
+    "  /timezone +1   (Central Europe winter)\n" +
+    "  /timezone +2   (Central Europe summer)\n" +
+    "  /timezone 0    (UTC / UK)\n" +
+    "  /timezone -5   (US Eastern)\n\n" +
+    "Commands:\n" +
+    "  task <text> [time]   — create a task\n" +
+    "  timer <duration> [label]   — set a timer\n" +
+    "  /timezone <offset>   — set your timezone"
+  );
 }
 
 // Parses "/timezone +2", "/timezone -5", "/timezone 120", "/timezone 0" etc.
@@ -241,11 +253,14 @@ async function handleTimezoneCommand(message, rawInput) {
   if (offset === null) {
     await sendTelegramMessage(
       chatId,
-      "Could not parse timezone.\n" +
-      "Use your UTC offset in hours or minutes:\n" +
-      "  /timezone +2   (UTC+2)\n" +
-      "  /timezone -5   (UTC-5)\n" +
-      "  /timezone 0    (UTC)"
+      "Could not parse that timezone.\n\n" +
+      "Send your UTC offset as hours:\n" +
+      "  /timezone +2   → UTC+2 (e.g. Central Europe summer)\n" +
+      "  /timezone +1   → UTC+1 (e.g. Central Europe winter)\n" +
+      "  /timezone 0    → UTC (e.g. UK)\n" +
+      "  /timezone -5   → UTC-5 (e.g. US Eastern)\n" +
+      "  /timezone +5.5 → UTC+5:30 (e.g. India)\n\n" +
+      "Find your offset at: worldtimeserver.com"
     );
     return;
   }
