@@ -151,9 +151,11 @@ function normalizeEuropeanDates(input) {
 }
 
 // Extracts an optional due date from natural language input using chrono-node.
-// Returns { title, dueAt, dateText } where:
-//   dueAt    - parsed Date object or null
-//   dateText - the date phrase echoed back in confirmation messages
+// Returns { title, dueAt, dateText, scheduleReminder } where:
+//   dueAt            - parsed Date for any date expression (stored as due_at on the task event)
+//   dateText         - the date phrase echoed back in confirmation messages (null if no time given)
+//   scheduleReminder - true only when the user specified an explicit time (hour),
+//                      meaning a reminder should actually be sent
 function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   // Normalize European dates before parsing so chrono-node understands them.
   const normalized = normalizeEuropeanDates(rawInput);
@@ -161,7 +163,7 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   const results = chrono.parse(normalized, { instant: new Date(), timezone: timezoneOffsetMinutes }, { forwardDate: true });
 
   if (results.length === 0) {
-    return { title: rawInput.trim(), dueAt: null, dateText: null };
+    return { title: rawInput.trim(), dueAt: null, dateText: null, scheduleReminder: false };
   }
 
   const match = results[0];
@@ -174,13 +176,16 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   const raw = `${before} ${after}`.trim().replace(/\s+(at|on|in|by|for)$/i, "").trim();
   const title = raw || rawInput.trim();
 
-  // Only schedule a reminder if the user specified an explicit time (hour).
-  // "tomorrow", "today", "Friday" without a time do not produce a reminder.
-  if (!match.start.isCertain("hour")) {
-    return { title, dueAt: null, dateText: null };
-  }
+  // Always store the parsed date so the todo app receives it as due_at.
+  // Only schedule a reminder when the user provided an explicit time (hour).
+  const scheduleReminder = match.start.isCertain("hour");
 
-  return { title, dueAt: match.date(), dateText: match.text };
+  return {
+    title,
+    dueAt: match.date(),
+    dateText: scheduleReminder ? match.text : null,
+    scheduleReminder
+  };
 }
 
 async function telegramRequest(method, payload) {
@@ -452,7 +457,7 @@ async function handleTaskCommand(message, rawInput) {
 
   const userId = connRows[0].user_id;
   const timezoneOffset = connRows[0].timezone_offset_minutes ?? defaultTimezoneOffsetMinutes;
-  const { title, dueAt, dateText } = extractDueDate(rawInput, timezoneOffset);
+  const { title, dueAt, dateText, scheduleReminder } = extractDueDate(rawInput, timezoneOffset);
 
   console.log(`[task] user=${userId} title="${title}" dueAt=${dueAt?.toISOString() ?? "none"}`);
 
@@ -482,7 +487,7 @@ async function handleTaskCommand(message, rawInput) {
     const eventId = eventRows[0].id;
     let reminderId = null;
 
-    if (dueAt) {
+    if (dueAt && scheduleReminder) {
       const { rows: reminderRows } = await client.query(
         `
           INSERT INTO reminders (user_id, message_text, scheduled_at, status, remote_task_event_id)
