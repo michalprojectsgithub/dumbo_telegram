@@ -142,7 +142,6 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   }
 
   const match = results[0];
-  const dueAt = match.date();
 
   const before = rawInput.slice(0, match.index).trimEnd();
   const after = rawInput.slice(match.index + match.text.length).trimStart();
@@ -151,8 +150,13 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   const raw = `${before} ${after}`.trim().replace(/\s+(at|on|in|by|for)$/i, "").trim();
   const title = raw || rawInput.trim();
 
-  // Preserve the original date text the user typed so we can echo it back exactly
-  return { title, dueAt, dateText: match.text };
+  // Only schedule a reminder if the user specified an explicit time (hour).
+  // "tomorrow", "today", "Friday" without a time do not produce a reminder.
+  if (!match.start.isCertain("hour")) {
+    return { title, dueAt: null, dateText: null };
+  }
+
+  return { title, dueAt: match.date(), dateText: match.text };
 }
 
 async function telegramRequest(method, payload) {
