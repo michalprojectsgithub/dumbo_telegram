@@ -469,12 +469,12 @@ async function handleTaskCommand(message, rawInput) {
     const { rows: eventRows } = await client.query(
       `
         INSERT INTO remote_task_events
-          (user_id, telegram_chat_id, telegram_message_id, raw_input, title, due_at)
-        VALUES ($1, $2, $3, $4, $5, $6)
+          (user_id, telegram_chat_id, telegram_message_id, raw_input, title, due_at, has_time)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (telegram_chat_id, telegram_message_id) DO NOTHING
         RETURNING id
       `,
-      [userId, chatId, telegramMessageId, rawInput, title, dueAt ?? null]
+      [userId, chatId, telegramMessageId, rawInput, title, dueAt ?? null, scheduleReminder]
     );
 
     // Conflict means this exact Telegram message was already processed — skip silently
@@ -861,7 +861,7 @@ app.get("/remote-task-events", async (req, res) => {
     const { rows } = await query(
       `
         SELECT
-          id, user_id, source, event_type, raw_input, title, due_at,
+          id, user_id, source, event_type, raw_input, title, due_at, has_time,
           reminder_id, reminder_scheduled,
           processed_by_desktop, processed_at, created_at
         FROM remote_task_events

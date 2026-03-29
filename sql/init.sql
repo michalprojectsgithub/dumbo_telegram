@@ -71,3 +71,6 @@ CREATE TABLE IF NOT EXISTS remote_task_events (
 
 CREATE INDEX IF NOT EXISTS remote_task_events_user_idx
   ON remote_task_events (user_id, processed_by_desktop, created_at DESC);
+
+-- Whether the task was created with an explicit time (and therefore a reminder was/could be scheduled).
+ALTER TABLE remote_task_events ADD COLUMN IF NOT EXISTS has_time BOOLEAN NOT NULL DEFAULT FALSE;
