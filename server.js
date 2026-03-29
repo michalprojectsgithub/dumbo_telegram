@@ -183,7 +183,7 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
   return {
     title,
     dueAt: match.date(),
-    dateText: scheduleReminder ? match.text : null,
+    dateText: match.text,   // always the phrase the user typed, e.g. "30 March" or "tomorrow at 10:00"
     scheduleReminder
   };
 }
@@ -512,8 +512,10 @@ async function handleTaskCommand(message, rawInput) {
 
     // Send Telegram confirmation — echo the user's original date text to avoid UTC confusion
     let confirmText = `Task created: ${title}`;
-    if (dueAt) {
+    if (scheduleReminder && dateText) {
       confirmText += `\nReminder set for: ${dateText}`;
+    } else if (dateText) {
+      confirmText += `\nDue: ${dateText}`;
     }
     await sendTelegramMessage(chatId, confirmText);
 
