@@ -74,3 +74,26 @@ CREATE INDEX IF NOT EXISTS remote_task_events_user_idx
 
 -- Whether the task was created with an explicit time (and therefore a reminder was/could be scheduled).
 ALTER TABLE remote_task_events ADD COLUMN IF NOT EXISTS has_time BOOLEAN NOT NULL DEFAULT FALSE;
+
+-- Stores repeating habit reminders created by the desktop app.
+-- The worker fires next_fire_at, sends a Telegram message, then advances next_fire_at to the next occurrence.
+CREATE TABLE IF NOT EXISTS habit_reminders (
+  id BIGSERIAL PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  -- 'daily' = every day, 'weekly' = one specific day, 'custom' = multiple specific days
+  schedule_type TEXT NOT NULL CHECK (schedule_type IN ('daily', 'weekly', 'custom')),
+  -- Array of weekday integers: 0=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat
+  days_of_week INTEGER[] NOT NULL,
+  -- Local time of day in HH:MM format (stored as TIME, interpreted in timezone_offset_minutes)
+  time_of_day TIME NOT NULL,
+  timezone_offset_minutes INTEGER NOT NULL DEFAULT 0,
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  next_fire_at TIMESTAMPTZ,
+  last_notified_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS habit_reminders_fire_idx
+  ON habit_reminders (next_fire_at)
+  WHERE active = TRUE;

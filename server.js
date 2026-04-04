@@ -12,6 +12,7 @@ const telegramApiBaseUrl = `https://api.telegram.org/bot${telegramBotToken}`;
 const pollingIntervalMs = Number(process.env.TELEGRAM_POLL_INTERVAL_MS || 3000);
 const workerIntervalMs = Number(process.env.REMINDER_WORKER_INTERVAL_MS || 3000);
 const corsOrigin = process.env.CORS_ORIGIN || "*";
+const habitWorkerIntervalMs = Number(process.env.HABIT_WORKER_INTERVAL_MS || 60000);
 // Fallback timezone offset used only if a user has not set their own via /timezone.
 // UTC offset in minutes. UTC+2 = 120, UTC-5 = -300. Default: 0 (UTC).
 const defaultTimezoneOffsetMinutes = Number(process.env.USER_TIMEZONE_OFFSET_MINUTES || 0);
@@ -27,7 +28,7 @@ let workerInProgress = false;
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", corsOrigin);
   res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
 
   if (req.method === "OPTIONS") {
@@ -186,6 +187,85 @@ function extractDueDate(rawInput, timezoneOffsetMinutes = 0) {
     dateText: match.text,   // always the phrase the user typed, e.g. "30 March" or "tomorrow at 10:00"
     scheduleReminder
   };
+}
+
+// --- Habit reminder helpers ---
+
+// Computes the next UTC fire time for a habit given its schedule and user timezone.
+// daysOfWeek: array of integers 0-6 (0=Sun, 1=Mon, ..., 6=Sat)
+// timeOfDay: "HH:MM" or "HH:MM:SS" string in the user's local time
+// Returns a Date (UTC) for the next occurrence after now, or null if daysOfWeek is empty.
+function computeNextFireAt(daysOfWeek, timeOfDay, timezoneOffsetMinutes) {
+  if (!daysOfWeek || daysOfWeek.length === 0) return null;
+  const [hours, minutes] = timeOfDay.split(":").map(Number);
+  const now = new Date();
+
+  for (let daysAhead = 0; daysAhead <= 7; daysAhead++) {
+    // Shift current time into user's local timezone by treating UTC as local
+    const localMs = now.getTime() + timezoneOffsetMinutes * 60 * 1000;
+    const localCandidate = new Date(localMs);
+    localCandidate.setUTCDate(localCandidate.getUTCDate() + daysAhead);
+    localCandidate.setUTCHours(hours, minutes, 0, 0);
+
+    if (daysOfWeek.includes(localCandidate.getUTCDay())) {
+      // Convert local candidate back to UTC
+      const fireAtUtc = new Date(localCandidate.getTime() - timezoneOffsetMinutes * 60 * 1000);
+      if (fireAtUtc > now) return fireAtUtc;
+    }
+  }
+
+  return null;
+}
+
+async function processHabitReminders() {
+  try {
+    // Atomically claim due habits to prevent duplicate delivery across server instances
+    const { rows } = await query(
+      `
+        WITH claimed AS (
+          SELECT id FROM habit_reminders
+          WHERE active = TRUE AND next_fire_at <= NOW()
+          ORDER BY next_fire_at ASC
+          LIMIT 20
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE habit_reminders
+        SET last_notified_at = NOW()
+        FROM claimed
+        WHERE habit_reminders.id = claimed.id
+        RETURNING habit_reminders.id, habit_reminders.user_id, habit_reminders.title,
+                  habit_reminders.days_of_week, habit_reminders.time_of_day,
+                  habit_reminders.timezone_offset_minutes
+      `
+    );
+
+    for (const habit of rows) {
+      const { rows: connRows } = await query(
+        "SELECT telegram_chat_id FROM telegram_connections WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        [habit.user_id]
+      );
+
+      if (connRows[0]?.telegram_chat_id) {
+        try {
+          await sendTelegramMessage(connRows[0].telegram_chat_id, `🔁 Habit reminder: ${habit.title}`);
+          console.log(`[habits] Sent habit id=${habit.id} title="${habit.title}"`);
+        } catch (error) {
+          console.error(`[habits] Failed to send habit id=${habit.id}:`, error);
+        }
+      } else {
+        console.error(`[habits] No Telegram connection for user_id=${habit.user_id}`);
+      }
+
+      // Always advance to the next occurrence regardless of send success
+      const nextFireAt = computeNextFireAt(habit.days_of_week, habit.time_of_day, habit.timezone_offset_minutes);
+      await query(
+        "UPDATE habit_reminders SET next_fire_at = $2 WHERE id = $1",
+        [habit.id, nextFireAt]
+      );
+    }
+  } catch (error) {
+    console.error("[habits] Worker error:", error);
+  }
 }
 
 async function telegramRequest(method, payload) {
@@ -910,6 +990,159 @@ app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
   }
 });
 
+function isValidTimeOfDay(value) {
+  return typeof value === "string" && /^\d{1,2}:\d{2}$/.test(value);
+}
+
+function isValidDaysOfWeek(value) {
+  return Array.isArray(value) && value.length > 0 &&
+    value.every(d => Number.isInteger(d) && d >= 0 && d <= 6);
+}
+
+// POST /habit-reminders — create a repeating habit reminder
+app.post("/habit-reminders", async (req, res) => {
+  const { userId, title, scheduleType, daysOfWeek, timeOfDay, timezoneOffsetMinutes } = req.body || {};
+
+  if (!isValidUserId(userId)) return res.status(400).json({ ok: false, error: "Invalid userId." });
+  if (!isValidMessageText(title)) return res.status(400).json({ ok: false, error: "Invalid title." });
+  if (!["daily", "weekly", "custom"].includes(scheduleType)) {
+    return res.status(400).json({ ok: false, error: "scheduleType must be 'daily', 'weekly', or 'custom'." });
+  }
+  if (!isValidDaysOfWeek(daysOfWeek)) {
+    return res.status(400).json({ ok: false, error: "daysOfWeek must be a non-empty array of integers 0–6." });
+  }
+  if (!isValidTimeOfDay(timeOfDay)) {
+    return res.status(400).json({ ok: false, error: "timeOfDay must be in HH:MM format." });
+  }
+
+  const tzOffset = Number.isInteger(timezoneOffsetMinutes) ? timezoneOffsetMinutes : 0;
+  const nextFireAt = computeNextFireAt(daysOfWeek, timeOfDay, tzOffset);
+
+  try {
+    const { rows } = await query(
+      `
+        INSERT INTO habit_reminders
+          (user_id, title, schedule_type, days_of_week, time_of_day, timezone_offset_minutes, next_fire_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING id, user_id, title, schedule_type, days_of_week, time_of_day,
+                  timezone_offset_minutes, active, next_fire_at, last_notified_at, created_at
+      `,
+      [userId.trim(), title.trim(), scheduleType, daysOfWeek, timeOfDay, tzOffset, nextFireAt]
+    );
+    return res.status(201).json({ ok: true, habit: rows[0] });
+  } catch (error) {
+    console.error("Failed to create habit:", error);
+    return res.status(500).json({ ok: false, error: "Failed to create habit reminder." });
+  }
+});
+
+// GET /habit-reminders?userId=... — list all habits for a user
+app.get("/habit-reminders", async (req, res) => {
+  const userId = req.query.userId?.trim();
+  if (!isValidUserId(userId)) return res.status(400).json({ ok: false, error: "Invalid or missing userId." });
+
+  try {
+    const { rows } = await query(
+      `
+        SELECT id, user_id, title, schedule_type, days_of_week, time_of_day,
+               timezone_offset_minutes, active, next_fire_at, last_notified_at, created_at
+        FROM habit_reminders
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+      `,
+      [userId]
+    );
+    return res.json({ ok: true, habits: rows });
+  } catch (error) {
+    console.error("Failed to fetch habits:", error);
+    return res.status(500).json({ ok: false, error: "Failed to fetch habit reminders." });
+  }
+});
+
+// PATCH /habit-reminders/:id — update title, schedule, or active status
+app.patch("/habit-reminders/:id", async (req, res) => {
+  const habitId = Number(req.params.id);
+  if (!Number.isInteger(habitId) || habitId <= 0) {
+    return res.status(400).json({ ok: false, error: "Invalid habit id." });
+  }
+
+  const { title, scheduleType, daysOfWeek, timeOfDay, timezoneOffsetMinutes, active } = req.body || {};
+  const sets = [];
+  const values = [];
+  let idx = 1;
+
+  if (title !== undefined) {
+    if (!isValidMessageText(title)) return res.status(400).json({ ok: false, error: "Invalid title." });
+    sets.push(`title = $${idx++}`); values.push(title.trim());
+  }
+  if (scheduleType !== undefined) {
+    if (!["daily", "weekly", "custom"].includes(scheduleType)) {
+      return res.status(400).json({ ok: false, error: "Invalid scheduleType." });
+    }
+    sets.push(`schedule_type = $${idx++}`); values.push(scheduleType);
+  }
+  if (daysOfWeek !== undefined) {
+    if (!isValidDaysOfWeek(daysOfWeek)) return res.status(400).json({ ok: false, error: "Invalid daysOfWeek." });
+    sets.push(`days_of_week = $${idx++}`); values.push(daysOfWeek);
+  }
+  if (timeOfDay !== undefined) {
+    if (!isValidTimeOfDay(timeOfDay)) return res.status(400).json({ ok: false, error: "timeOfDay must be HH:MM." });
+    sets.push(`time_of_day = $${idx++}`); values.push(timeOfDay);
+  }
+  if (timezoneOffsetMinutes !== undefined) {
+    sets.push(`timezone_offset_minutes = $${idx++}`); values.push(Number(timezoneOffsetMinutes));
+  }
+  if (active !== undefined) {
+    sets.push(`active = $${idx++}`); values.push(Boolean(active));
+  }
+
+  if (sets.length === 0) return res.status(400).json({ ok: false, error: "No fields to update." });
+
+  try {
+    const { rows: existing } = await query("SELECT * FROM habit_reminders WHERE id = $1", [habitId]);
+    if (existing.length === 0) return res.status(404).json({ ok: false, error: "Habit not found." });
+
+    const current = existing[0];
+    const scheduleChanged = daysOfWeek !== undefined || timeOfDay !== undefined || timezoneOffsetMinutes !== undefined;
+    const reactivating = active === true && !current.active;
+
+    if (scheduleChanged || reactivating) {
+      const newDays = daysOfWeek ?? current.days_of_week;
+      const newTime = timeOfDay ?? current.time_of_day;
+      const newTz = timezoneOffsetMinutes ?? current.timezone_offset_minutes;
+      sets.push(`next_fire_at = $${idx++}`);
+      values.push(computeNextFireAt(newDays, newTime, newTz));
+    }
+
+    values.push(habitId);
+    const { rows } = await query(
+      `UPDATE habit_reminders SET ${sets.join(", ")} WHERE id = $${idx} RETURNING *`,
+      values
+    );
+    return res.json({ ok: true, habit: rows[0] });
+  } catch (error) {
+    console.error("Failed to update habit:", error);
+    return res.status(500).json({ ok: false, error: "Failed to update habit reminder." });
+  }
+});
+
+// DELETE /habit-reminders/:id — permanently remove a habit
+app.delete("/habit-reminders/:id", async (req, res) => {
+  const habitId = Number(req.params.id);
+  if (!Number.isInteger(habitId) || habitId <= 0) {
+    return res.status(400).json({ ok: false, error: "Invalid habit id." });
+  }
+
+  try {
+    const { rowCount } = await query("DELETE FROM habit_reminders WHERE id = $1", [habitId]);
+    if (rowCount === 0) return res.status(404).json({ ok: false, error: "Habit not found." });
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error("Failed to delete habit:", error);
+    return res.status(500).json({ ok: false, error: "Failed to delete habit reminder." });
+  }
+});
+
 app.use((error, _req, res, _next) => {
   if (error instanceof SyntaxError && "body" in error) {
     return res.status(400).json({
@@ -926,6 +1159,7 @@ app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
   console.log(`Polling Telegram every ${pollingIntervalMs}ms`);
   console.log(`Running reminder worker every ${workerIntervalMs}ms`);
+  console.log(`Running habit worker every ${habitWorkerIntervalMs}ms`);
 });
 
 setInterval(() => {
@@ -936,8 +1170,13 @@ setInterval(() => {
   void processDueReminders();
 }, workerIntervalMs);
 
+setInterval(() => {
+  void processHabitReminders();
+}, habitWorkerIntervalMs);
+
 void pollTelegramUpdates();
 void processDueReminders();
+void processHabitReminders();
 
 process.on("SIGINT", async () => {
   await pool.end();
