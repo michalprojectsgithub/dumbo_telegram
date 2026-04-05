@@ -75,6 +75,32 @@ CREATE INDEX IF NOT EXISTS remote_task_events_user_idx
 -- Whether the task was created with an explicit time (and therefore a reminder was/could be scheduled).
 ALTER TABLE remote_task_events ADD COLUMN IF NOT EXISTS has_time BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Stores all todos synced from the desktop app.
+-- Todos with hasTime=true and a dueAt also get a row in the reminders table for Telegram delivery.
+CREATE TABLE IF NOT EXISTS todos (
+  id BIGSERIAL PRIMARY KEY,
+  app_todo_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  due_at TIMESTAMPTZ,
+  has_time BOOLEAN NOT NULL DEFAULT FALSE,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  completed_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (user_id, app_todo_id)
+);
+
+CREATE INDEX IF NOT EXISTS todos_user_idx
+  ON todos (user_id, completed, due_at);
+
+-- Link reminders back to the todo that created them, so we can cancel/update them when the todo changes.
+ALTER TABLE reminders ADD COLUMN IF NOT EXISTS app_todo_id TEXT;
+
+CREATE INDEX IF NOT EXISTS reminders_app_todo_idx
+  ON reminders (user_id, app_todo_id)
+  WHERE app_todo_id IS NOT NULL;
+
 -- Stores repeating habit reminders created by the desktop app.
 -- The worker fires next_fire_at, sends a Telegram message, then advances next_fire_at to the next occurrence.
 CREATE TABLE IF NOT EXISTS habit_reminders (

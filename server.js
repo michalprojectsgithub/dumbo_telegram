@@ -990,6 +990,40 @@ app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
   }
 });
 
+// Keeps the reminders table in sync with a todo's current state.
+// - Creates a pending reminder when the todo has an explicit time and is not completed.
+// - Deletes any pending reminder when the todo is completed, has no date, or has no time.
+async function syncReminderForTodo(client, userId, appTodoId, title, dueAt, hasTime, completed) {
+  const { rows: existing } = await client.query(
+    `SELECT id FROM reminders
+     WHERE user_id = $1 AND app_todo_id = $2 AND status IN ('pending', 'sending')
+     LIMIT 1`,
+    [userId, appTodoId]
+  );
+
+  const shouldHaveReminder = hasTime && dueAt && !completed;
+
+  if (!shouldHaveReminder) {
+    if (existing.length > 0) {
+      await client.query("DELETE FROM reminders WHERE id = $1", [existing[0].id]);
+    }
+    return;
+  }
+
+  if (existing.length > 0) {
+    await client.query(
+      "UPDATE reminders SET message_text = $2, scheduled_at = $3 WHERE id = $1",
+      [existing[0].id, `Reminder: ${title}`, dueAt]
+    );
+  } else {
+    await client.query(
+      `INSERT INTO reminders (user_id, message_text, scheduled_at, status, app_todo_id)
+       VALUES ($1, $2, $3, 'pending', $4)`,
+      [userId, `Reminder: ${title}`, dueAt, appTodoId]
+    );
+  }
+}
+
 function isValidTimeOfDay(value) {
   return typeof value === "string" && /^\d{1,2}:\d{2}$/.test(value);
 }
@@ -1140,6 +1174,137 @@ app.delete("/habit-reminders/:id", async (req, res) => {
   } catch (error) {
     console.error("Failed to delete habit:", error);
     return res.status(500).json({ ok: false, error: "Failed to delete habit reminder." });
+  }
+});
+
+// POST /todos — create or update (upsert) a todo by userId + appTodoId.
+// The desktop app calls this whenever a todo is created or changed.
+// Automatically manages a Telegram reminder if the todo has an explicit date+time.
+app.post("/todos", async (req, res) => {
+  const { userId, appTodoId, title, dueAt, hasTime, completed } = req.body || {};
+
+  if (!isValidUserId(userId)) {
+    return res.status(400).json({ ok: false, error: "Invalid userId." });
+  }
+  if (typeof appTodoId !== "string" || appTodoId.trim().length === 0) {
+    return res.status(400).json({ ok: false, error: "Invalid appTodoId." });
+  }
+  if (!isValidMessageText(title)) {
+    return res.status(400).json({ ok: false, error: "Invalid title." });
+  }
+
+  const parsedDueAt = dueAt ? parseScheduledAt(dueAt) : null;
+  if (dueAt && !parsedDueAt) {
+    return res.status(400).json({ ok: false, error: "Invalid dueAt. Use an ISO datetime string." });
+  }
+
+  const isHasTime = Boolean(hasTime);
+  const isCompleted = Boolean(completed);
+  const completedAt = isCompleted ? new Date() : null;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      `
+        INSERT INTO todos (app_todo_id, user_id, title, due_at, has_time, completed, completed_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (user_id, app_todo_id) DO UPDATE SET
+          title        = EXCLUDED.title,
+          due_at       = EXCLUDED.due_at,
+          has_time     = EXCLUDED.has_time,
+          completed    = EXCLUDED.completed,
+          completed_at = CASE
+            WHEN EXCLUDED.completed AND NOT todos.completed THEN NOW()
+            WHEN NOT EXCLUDED.completed THEN NULL
+            ELSE todos.completed_at
+          END,
+          updated_at   = NOW()
+        RETURNING *
+      `,
+      [appTodoId.trim(), userId.trim(), title.trim(), parsedDueAt, isHasTime, isCompleted, completedAt]
+    );
+
+    await syncReminderForTodo(client, userId.trim(), appTodoId.trim(), title.trim(), parsedDueAt, isHasTime, isCompleted);
+
+    await client.query("COMMIT");
+    return res.status(201).json({ ok: true, todo: rows[0] });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Failed to upsert todo:", error);
+    return res.status(500).json({ ok: false, error: "Failed to save todo." });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /todos?userId=...&completed=false|true — list todos for a user.
+app.get("/todos", async (req, res) => {
+  const userId = req.query.userId?.trim();
+  if (!isValidUserId(userId)) {
+    return res.status(400).json({ ok: false, error: "Invalid or missing userId." });
+  }
+
+  const completedParam = req.query.completed;
+  let filter = "";
+  if (completedParam === "false") filter = "AND completed = FALSE";
+  if (completedParam === "true") filter = "AND completed = TRUE";
+
+  try {
+    const { rows } = await query(
+      `
+        SELECT id, app_todo_id, user_id, title, due_at, has_time,
+               completed, completed_at, created_at, updated_at
+        FROM todos
+        WHERE user_id = $1 ${filter}
+        ORDER BY due_at ASC NULLS LAST, created_at DESC
+        LIMIT 500
+      `,
+      [userId]
+    );
+    return res.json({ ok: true, todos: rows });
+  } catch (error) {
+    console.error("Failed to fetch todos:", error);
+    return res.status(500).json({ ok: false, error: "Failed to fetch todos." });
+  }
+});
+
+// DELETE /todos/:appTodoId?userId=... — delete a todo and cancel its pending reminder.
+app.delete("/todos/:appTodoId", async (req, res) => {
+  const appTodoId = req.params.appTodoId?.trim();
+  const userId = req.query.userId?.trim();
+
+  if (!appTodoId) return res.status(400).json({ ok: false, error: "Invalid appTodoId." });
+  if (!isValidUserId(userId)) return res.status(400).json({ ok: false, error: "Invalid userId." });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // Remove any pending reminder first
+    await client.query(
+      "DELETE FROM reminders WHERE user_id = $1 AND app_todo_id = $2 AND status IN ('pending', 'sending')",
+      [userId, appTodoId]
+    );
+
+    const { rowCount } = await client.query(
+      "DELETE FROM todos WHERE user_id = $1 AND app_todo_id = $2",
+      [userId, appTodoId]
+    );
+
+    await client.query("COMMIT");
+
+    if (rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Todo not found." });
+    }
+    return res.json({ ok: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Failed to delete todo:", error);
+    return res.status(500).json({ ok: false, error: "Failed to delete todo." });
+  } finally {
+    client.release();
   }
 });
 
