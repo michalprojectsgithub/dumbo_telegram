@@ -1054,7 +1054,6 @@ app.get("/remote-task-events", async (req, res) => {
 // Optional body: { appTodoId } — links the event to the desktop todo for deduplication.
 app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
   const eventId = Number(req.params.id);
-  const appTodoId = typeof req.body?.appTodoId === "string" ? req.body.appTodoId.trim() : null;
 
   if (!Number.isInteger(eventId) || eventId <= 0) {
     return res.status(400).json({ ok: false, error: "Invalid event id." });
@@ -1062,13 +1061,8 @@ app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
 
   try {
     const { rowCount } = await query(
-      `
-        UPDATE remote_task_events
-        SET processed_by_desktop = TRUE, processed_at = NOW(),
-            app_todo_id = COALESCE($2, app_todo_id)
-        WHERE id = $1 AND processed_by_desktop = FALSE
-      `,
-      [eventId, appTodoId]
+      "DELETE FROM remote_task_events WHERE id = $1",
+      [eventId]
     );
 
     if (rowCount === 0) {
