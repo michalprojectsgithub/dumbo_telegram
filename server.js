@@ -673,8 +673,9 @@ async function handleAgendaCommand(message) {
   for (const todo of todos) {
     if (todo.has_time && todo.due_at) {
       const localTime = new Date(new Date(todo.due_at).getTime() + tzOffset * 60 * 1000);
-      const timeStr = localTime.toISOString().slice(11, 16);
-      lines.push(`• ${todo.title} at ${timeStr}`);
+      const h = localTime.getUTCHours();
+      const m = String(localTime.getUTCMinutes()).padStart(2, "0");
+      lines.push(`• ${h}:${m} ${todo.title}`);
     } else {
       lines.push(`• ${todo.title}`);
     }
