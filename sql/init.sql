@@ -127,3 +127,6 @@ CREATE TABLE IF NOT EXISTS habit_reminders (
 CREATE INDEX IF NOT EXISTS habit_reminders_fire_idx
   ON habit_reminders (next_fire_at)
   WHERE active = TRUE;
+
+-- Tracks when the last morning brief was sent so the worker doesn't send duplicates.
+ALTER TABLE telegram_connections ADD COLUMN IF NOT EXISTS last_morning_brief_at TIMESTAMPTZ;

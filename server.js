@@ -268,6 +268,134 @@ async function processHabitReminders() {
   }
 }
 
+async function processMorningBriefs() {
+  try {
+    const now = new Date();
+
+    // Find users whose local time is past 6:00 AM and haven't received today's brief yet.
+    // For each user, local 6:00 AM in UTC = today-local 06:00 minus their offset.
+    const { rows: users } = await query(
+      `
+        SELECT user_id, telegram_chat_id, timezone_offset_minutes,
+               last_morning_brief_at
+        FROM telegram_connections
+      `
+    );
+
+    for (const user of users) {
+      const tzOffset = user.timezone_offset_minutes ?? 0;
+      const localNow = new Date(now.getTime() + tzOffset * 60 * 1000);
+
+      // Compute today's local 6:00 AM in UTC
+      const local6am = new Date(localNow);
+      local6am.setUTCHours(6, 0, 0, 0);
+      const utc6am = new Date(local6am.getTime() - tzOffset * 60 * 1000);
+
+      if (now < utc6am) continue;
+      if (user.last_morning_brief_at && new Date(user.last_morning_brief_at) >= utc6am) continue;
+
+      const userId = user.user_id;
+      const chatId = user.telegram_chat_id;
+
+      // Compute today and yesterday boundaries in UTC
+      const localDayStart = new Date(localNow);
+      localDayStart.setUTCHours(0, 0, 0, 0);
+      const localDayEnd = new Date(localNow);
+      localDayEnd.setUTCHours(23, 59, 59, 999);
+      const utcDayStart = new Date(localDayStart.getTime() - tzOffset * 60 * 1000);
+      const utcDayEnd = new Date(localDayEnd.getTime() - tzOffset * 60 * 1000);
+
+      const utcYesterdayStart = new Date(utcDayStart.getTime() - 24 * 60 * 60 * 1000);
+      const utcYesterdayEnd = new Date(utcDayEnd.getTime() - 24 * 60 * 60 * 1000);
+
+      // Today's tasks
+      const { rows: todayTasks } = await query(
+        `
+          SELECT title, due_at, has_time FROM todos
+          WHERE user_id = $1 AND completed = FALSE AND due_at >= $2 AND due_at <= $3
+          UNION ALL
+          SELECT title, due_at, has_time FROM remote_task_events
+          WHERE user_id = $1 AND due_at >= $2 AND due_at <= $3 AND processed_by_desktop = FALSE
+          ORDER BY has_time DESC, due_at ASC
+        `,
+        [userId, utcDayStart.toISOString(), utcDayEnd.toISOString()]
+      );
+
+      // Yesterday's unfinished tasks
+      const { rows: carriedOver } = await query(
+        `
+          SELECT title, due_at, has_time FROM todos
+          WHERE user_id = $1 AND completed = FALSE AND due_at >= $2 AND due_at <= $3
+          ORDER BY has_time DESC, due_at ASC
+        `,
+        [userId, utcYesterdayStart.toISOString(), utcYesterdayEnd.toISOString()]
+      );
+
+      // Today's habits
+      const localDayOfWeek = localNow.getUTCDay();
+      const { rows: todayHabits } = await query(
+        `
+          SELECT title, time_of_day FROM habit_reminders
+          WHERE user_id = $1 AND active = TRUE AND $2 = ANY(days_of_week)
+          ORDER BY time_of_day ASC
+        `,
+        [userId, localDayOfWeek]
+      );
+
+      if (todayTasks.length === 0 && carriedOver.length === 0 && todayHabits.length === 0) {
+        await query("UPDATE telegram_connections SET last_morning_brief_at = NOW() WHERE user_id = $1", [userId]);
+        continue;
+      }
+
+      const lines = ["Morning brief\n"];
+
+      if (todayTasks.length > 0) {
+        lines.push("Today's tasks:");
+        for (const t of todayTasks) {
+          if (t.has_time && t.due_at) {
+            const localTime = new Date(new Date(t.due_at).getTime() + tzOffset * 60 * 1000);
+            const h = localTime.getUTCHours();
+            const m = String(localTime.getUTCMinutes()).padStart(2, "0");
+            lines.push(`- ${h}:${m} ${t.title}`);
+          } else {
+            lines.push(`- ${t.title}`);
+          }
+        }
+      }
+
+      if (carriedOver.length > 0) {
+        if (todayTasks.length > 0) lines.push("");
+        lines.push("Carried over from yesterday:");
+        for (const t of carriedOver) {
+          lines.push(`- ${t.title}`);
+        }
+      }
+
+      if (todayHabits.length > 0) {
+        if (todayTasks.length > 0 || carriedOver.length > 0) lines.push("");
+        lines.push("Today's habits:");
+        for (const h of todayHabits) {
+          const [hh, mm] = String(h.time_of_day).split(":");
+          const hour = parseInt(hh, 10);
+          const min = mm || "00";
+          lines.push(`- ${hour}:${min} ${h.title}`);
+        }
+      }
+
+      try {
+        await sendTelegramMessage(chatId, lines.join("\n"));
+        console.log(`[brief] Sent morning brief to user=${userId}`);
+      } catch (error) {
+        console.error(`[brief] Failed to send to user=${userId}:`, error);
+      }
+
+      await query("UPDATE telegram_connections SET last_morning_brief_at = NOW() WHERE user_id = $1", [userId]);
+    }
+  } catch (error) {
+    console.error("[brief] Worker error:", error);
+  }
+}
+
 async function telegramRequest(method, payload) {
   const response = await fetch(`${telegramApiBaseUrl}/${method}`, {
     method: "POST",
@@ -1455,9 +1583,14 @@ setInterval(() => {
   void processHabitReminders();
 }, habitWorkerIntervalMs);
 
+setInterval(() => {
+  void processMorningBriefs();
+}, 60000);
+
 void pollTelegramUpdates();
 void processDueReminders();
 void processHabitReminders();
+void processMorningBriefs();
 
 process.on("SIGINT", async () => {
   await pool.end();
