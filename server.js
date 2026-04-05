@@ -778,6 +778,9 @@ async function processTelegramUpdate(update) {
       await handleAgendaCommand(message);
     } catch (error) {
       console.error("Failed processing agenda command:", error);
+      try {
+        await sendTelegramMessage(String(message.chat?.id), "Sorry, failed to load the agenda. Please try again.");
+      } catch {}
     }
     return;
   }
