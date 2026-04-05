@@ -335,6 +335,7 @@ async function handleStartCommand(message) {
     "Commands:\n" +
     "  task <text> [time]   — create a task\n" +
     "  timer <duration> [label]   — set a timer\n" +
+    "  agenda   — show today's tasks\n" +
     "  /timezone <offset>   — set your timezone"
   );
 }
@@ -607,6 +608,72 @@ async function handleTaskCommand(message, rawInput) {
   }
 }
 
+async function handleAgendaCommand(message) {
+  const chat = message.chat || {};
+  const chatId = String(chat.id);
+
+  const { rows: connRows } = await query(
+    "SELECT user_id, timezone_offset_minutes FROM telegram_connections WHERE telegram_chat_id = $1 ORDER BY created_at DESC LIMIT 1",
+    [chatId]
+  );
+
+  if (connRows.length === 0) {
+    await sendTelegramMessage(chatId, "You are not connected. Please send /start <your-user-id> first.");
+    return;
+  }
+
+  const userId = connRows[0].user_id;
+  const tzOffset = connRows[0].timezone_offset_minutes ?? 0;
+
+  // Compute today's start and end in UTC relative to the user's local timezone
+  const now = new Date();
+  const localNow = new Date(now.getTime() + tzOffset * 60 * 1000);
+
+  const localDayStart = new Date(localNow);
+  localDayStart.setUTCHours(0, 0, 0, 0);
+  const localDayEnd = new Date(localNow);
+  localDayEnd.setUTCHours(23, 59, 59, 999);
+
+  const utcDayStart = new Date(localDayStart.getTime() - tzOffset * 60 * 1000);
+  const utcDayEnd = new Date(localDayEnd.getTime() - tzOffset * 60 * 1000);
+
+  const { rows: todos } = await query(
+    `
+      SELECT title, due_at, has_time
+      FROM todos
+      WHERE user_id = $1
+        AND completed = FALSE
+        AND due_at >= $2
+        AND due_at <= $3
+      ORDER BY has_time DESC, due_at ASC
+    `,
+    [userId, utcDayStart.toISOString(), utcDayEnd.toISOString()]
+  );
+
+  if (todos.length === 0) {
+    await sendTelegramMessage(chatId, "📅 No tasks due today.");
+    return;
+  }
+
+  const dayName = localNow.toLocaleDateString("en-US", { weekday: "long", timeZone: "UTC" });
+  const dateStr = localNow.toLocaleDateString("en-US", { month: "long", day: "numeric", timeZone: "UTC" });
+
+  const lines = [`📅 Today's agenda — ${dayName}, ${dateStr}\n`];
+
+  for (const todo of todos) {
+    if (todo.has_time && todo.due_at) {
+      const localTime = new Date(new Date(todo.due_at).getTime() + tzOffset * 60 * 1000);
+      const timeStr = localTime.toISOString().slice(11, 16);
+      lines.push(`• ${todo.title} at ${timeStr}`);
+    } else {
+      lines.push(`• ${todo.title}`);
+    }
+  }
+
+  lines.push(`\n${todos.length} task${todos.length !== 1 ? "s" : ""} today`);
+  await sendTelegramMessage(chatId, lines.join("\n"));
+}
+
 async function saveInboxMessage(message) {
   const chat = message.chat || {};
   const chatId = String(chat.id);
@@ -687,6 +754,15 @@ async function processTelegramUpdate(update) {
       } catch {
         // ignore secondary failure
       }
+    }
+    return;
+  }
+
+  if (/^\/?(agenda)$/i.test(message.text.trim())) {
+    try {
+      await handleAgendaCommand(message);
+    } catch (error) {
+      console.error("Failed processing agenda command:", error);
     }
     return;
   }
