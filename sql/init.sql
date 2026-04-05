@@ -128,5 +128,6 @@ CREATE INDEX IF NOT EXISTS habit_reminders_fire_idx
   ON habit_reminders (next_fire_at)
   WHERE active = TRUE;
 
--- Tracks when the last morning brief was sent so the worker doesn't send duplicates.
-ALTER TABLE telegram_connections ADD COLUMN IF NOT EXISTS last_morning_brief_at TIMESTAMPTZ;
+-- Next scheduled morning brief delivery (UTC). The habit worker sends it when due
+-- and advances to the next day's 6:00 AM local time.
+ALTER TABLE telegram_connections ADD COLUMN IF NOT EXISTS next_morning_brief_at TIMESTAMPTZ;

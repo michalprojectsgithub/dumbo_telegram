@@ -217,6 +217,21 @@ function computeNextFireAt(daysOfWeek, timeOfDay, timezoneOffsetMinutes) {
   return null;
 }
 
+function computeNextMorningBriefAt(timezoneOffsetMinutes) {
+  const now = new Date();
+  const localMs = now.getTime() + timezoneOffsetMinutes * 60 * 1000;
+  const localNow = new Date(localMs);
+
+  const today6am = new Date(localNow);
+  today6am.setUTCHours(6, 0, 0, 0);
+
+  const local6amUtc = new Date(today6am.getTime() - timezoneOffsetMinutes * 60 * 1000);
+  if (local6amUtc > now) return local6amUtc;
+
+  const tomorrow6am = new Date(today6am.getTime() + 24 * 60 * 60 * 1000);
+  return new Date(tomorrow6am.getTime() - timezoneOffsetMinutes * 60 * 1000);
+}
+
 async function processHabitReminders() {
   try {
     // Atomically claim due habits to prevent duplicate delivery across server instances
@@ -266,38 +281,27 @@ async function processHabitReminders() {
   } catch (error) {
     console.error("[habits] Worker error:", error);
   }
+
+  await processMorningBriefs();
 }
 
 async function processMorningBriefs() {
   try {
-    const now = new Date();
-
-    // Find users whose local time is past 6:00 AM and haven't received today's brief yet.
-    // For each user, local 6:00 AM in UTC = today-local 06:00 minus their offset.
     const { rows: users } = await query(
       `
-        SELECT user_id, telegram_chat_id, timezone_offset_minutes,
-               last_morning_brief_at
+        SELECT user_id, telegram_chat_id, timezone_offset_minutes
         FROM telegram_connections
+        WHERE next_morning_brief_at IS NOT NULL AND next_morning_brief_at <= NOW()
       `
     );
 
     for (const user of users) {
       const tzOffset = user.timezone_offset_minutes ?? 0;
+      const now = new Date();
       const localNow = new Date(now.getTime() + tzOffset * 60 * 1000);
-
-      // Compute today's local 6:00 AM in UTC
-      const local6am = new Date(localNow);
-      local6am.setUTCHours(6, 0, 0, 0);
-      const utc6am = new Date(local6am.getTime() - tzOffset * 60 * 1000);
-
-      if (now < utc6am) continue;
-      if (user.last_morning_brief_at && new Date(user.last_morning_brief_at) >= utc6am) continue;
-
       const userId = user.user_id;
       const chatId = user.telegram_chat_id;
 
-      // Compute today and yesterday boundaries in UTC
       const localDayStart = new Date(localNow);
       localDayStart.setUTCHours(0, 0, 0, 0);
       const localDayEnd = new Date(localNow);
@@ -308,7 +312,6 @@ async function processMorningBriefs() {
       const utcYesterdayStart = new Date(utcDayStart.getTime() - 24 * 60 * 60 * 1000);
       const utcYesterdayEnd = new Date(utcDayEnd.getTime() - 24 * 60 * 60 * 1000);
 
-      // Today's tasks
       const { rows: todayTasks } = await query(
         `
           SELECT title, due_at, has_time FROM todos
@@ -321,7 +324,6 @@ async function processMorningBriefs() {
         [userId, utcDayStart.toISOString(), utcDayEnd.toISOString()]
       );
 
-      // Yesterday's unfinished tasks
       const { rows: carriedOver } = await query(
         `
           SELECT title, due_at, has_time FROM todos
@@ -331,7 +333,6 @@ async function processMorningBriefs() {
         [userId, utcYesterdayStart.toISOString(), utcYesterdayEnd.toISOString()]
       );
 
-      // Today's habits
       const localDayOfWeek = localNow.getUTCDay();
       const { rows: todayHabits } = await query(
         `
@@ -342,10 +343,11 @@ async function processMorningBriefs() {
         [userId, localDayOfWeek]
       );
 
-      if (todayTasks.length === 0 && carriedOver.length === 0 && todayHabits.length === 0) {
-        await query("UPDATE telegram_connections SET last_morning_brief_at = NOW() WHERE user_id = $1", [userId]);
-        continue;
-      }
+      // Advance to tomorrow's 6 AM regardless of whether we send
+      const nextBrief = computeNextMorningBriefAt(tzOffset);
+      await query("UPDATE telegram_connections SET next_morning_brief_at = $2 WHERE user_id = $1", [userId, nextBrief.toISOString()]);
+
+      if (todayTasks.length === 0 && carriedOver.length === 0 && todayHabits.length === 0) continue;
 
       const lines = ["Morning brief\n"];
 
@@ -388,8 +390,6 @@ async function processMorningBriefs() {
       } catch (error) {
         console.error(`[brief] Failed to send to user=${userId}:`, error);
       }
-
-      await query("UPDATE telegram_connections SET last_morning_brief_at = NOW() WHERE user_id = $1", [userId]);
     }
   } catch (error) {
     console.error("[brief] Worker error:", error);
@@ -441,16 +441,19 @@ async function handleStartCommand(message) {
   const resolvedUserId = userIdFromCommand || String(from.id || chat.id);
   const telegramUsername = from.username || null;
 
+  const nextBrief = computeNextMorningBriefAt(defaultTimezoneOffsetMinutes);
+
   await query(
     `
-      INSERT INTO telegram_connections (user_id, telegram_chat_id, telegram_username)
-      VALUES ($1, $2, $3)
+      INSERT INTO telegram_connections (user_id, telegram_chat_id, telegram_username, next_morning_brief_at)
+      VALUES ($1, $2, $3, $4)
       ON CONFLICT (user_id)
       DO UPDATE SET
         telegram_chat_id = EXCLUDED.telegram_chat_id,
-        telegram_username = EXCLUDED.telegram_username
+        telegram_username = EXCLUDED.telegram_username,
+        next_morning_brief_at = COALESCE(telegram_connections.next_morning_brief_at, EXCLUDED.next_morning_brief_at)
     `,
-    [resolvedUserId, String(chat.id), telegramUsername]
+    [resolvedUserId, String(chat.id), telegramUsername, nextBrief.toISOString()]
   );
 
   await sendTelegramMessage(
@@ -577,9 +580,11 @@ async function handleTimezoneCommand(message, rawInput) {
     return;
   }
 
+  const nextBrief = computeNextMorningBriefAt(offset);
+
   await query(
-    "UPDATE telegram_connections SET timezone_offset_minutes = $1 WHERE user_id = $2",
-    [offset, rows[0].user_id]
+    "UPDATE telegram_connections SET timezone_offset_minutes = $1, next_morning_brief_at = $3 WHERE user_id = $2",
+    [offset, rows[0].user_id, nextBrief.toISOString()]
   );
 
   const sign = offset >= 0 ? "+" : "";
@@ -1583,14 +1588,9 @@ setInterval(() => {
   void processHabitReminders();
 }, habitWorkerIntervalMs);
 
-setInterval(() => {
-  void processMorningBriefs();
-}, 60000);
-
 void pollTelegramUpdates();
 void processDueReminders();
 void processHabitReminders();
-void processMorningBriefs();
 
 process.on("SIGINT", async () => {
   await pool.end();
