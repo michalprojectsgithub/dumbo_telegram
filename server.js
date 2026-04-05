@@ -649,16 +649,11 @@ async function handleAgendaCommand(message) {
       UNION ALL
 
       SELECT title, due_at, has_time
-      FROM remote_task_events rte
-      WHERE rte.user_id = $1
-        AND rte.due_at >= $2
-        AND rte.due_at <= $3
-        AND NOT EXISTS (
-          SELECT 1 FROM todos t
-          WHERE t.user_id = rte.user_id
-            AND t.app_todo_id = rte.app_todo_id
-            AND t.completed = FALSE
-        )
+      FROM remote_task_events
+      WHERE user_id = $1
+        AND due_at >= $2
+        AND due_at <= $3
+        AND processed_by_desktop = FALSE
 
       ORDER BY has_time DESC, due_at ASC
     `,
