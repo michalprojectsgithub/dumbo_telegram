@@ -1051,28 +1051,57 @@ app.get("/remote-task-events", async (req, res) => {
 });
 
 // Desktop app calls this after importing a remote task event into local storage.
-// Optional body: { appTodoId } — links the event to the desktop todo for deduplication.
+// Moves the event into the todos table (using the desktop's appTodoId) and deletes the source row.
 app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
   const eventId = Number(req.params.id);
+  const appTodoId = typeof req.body?.appTodoId === "string" && req.body.appTodoId.trim().length > 0
+    ? req.body.appTodoId.trim()
+    : null;
 
   if (!Number.isInteger(eventId) || eventId <= 0) {
     return res.status(400).json({ ok: false, error: "Invalid event id." });
   }
 
+  const client = await pool.connect();
   try {
-    const { rowCount } = await query(
-      "DELETE FROM remote_task_events WHERE id = $1",
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
+      "SELECT user_id, title, due_at, has_time FROM remote_task_events WHERE id = $1",
       [eventId]
     );
 
-    if (rowCount === 0) {
+    if (rows.length === 0) {
+      await client.query("ROLLBACK");
       return res.status(404).json({ ok: false, error: "Event not found or already processed." });
     }
 
+    const event = rows[0];
+    const todoId = appTodoId || `rte_${eventId}`;
+
+    await client.query(
+      `
+        INSERT INTO todos (app_todo_id, user_id, title, due_at, has_time, completed)
+        VALUES ($1, $2, $3, $4, $5, FALSE)
+        ON CONFLICT (user_id, app_todo_id) DO UPDATE SET
+          title    = EXCLUDED.title,
+          due_at   = EXCLUDED.due_at,
+          has_time = EXCLUDED.has_time,
+          updated_at = NOW()
+      `,
+      [todoId, event.user_id, event.title, event.due_at, event.has_time]
+    );
+
+    await client.query("DELETE FROM remote_task_events WHERE id = $1", [eventId]);
+
+    await client.query("COMMIT");
     return res.json({ ok: true });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error("Failed to mark event as processed:", error);
     return res.status(500).json({ ok: false, error: "Failed to mark event as processed." });
+  } finally {
+    client.release();
   }
 });
 
