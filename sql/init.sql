@@ -75,6 +75,10 @@ CREATE INDEX IF NOT EXISTS remote_task_events_user_idx
 -- Whether the task was created with an explicit time (and therefore a reminder was/could be scheduled).
 ALTER TABLE remote_task_events ADD COLUMN IF NOT EXISTS has_time BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Links a remote task event to the desktop app's todo ID once the desktop has processed it.
+-- Used to deduplicate agenda results between remote_task_events and todos.
+ALTER TABLE remote_task_events ADD COLUMN IF NOT EXISTS app_todo_id TEXT;
+
 -- Stores all todos synced from the desktop app.
 -- Todos with hasTime=true and a dueAt also get a row in the reminders table for Telegram delivery.
 CREATE TABLE IF NOT EXISTS todos (

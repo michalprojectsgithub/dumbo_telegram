@@ -645,6 +645,21 @@ async function handleAgendaCommand(message) {
         AND completed = FALSE
         AND due_at >= $2
         AND due_at <= $3
+
+      UNION ALL
+
+      SELECT title, due_at, has_time
+      FROM remote_task_events rte
+      WHERE rte.user_id = $1
+        AND rte.due_at >= $2
+        AND rte.due_at <= $3
+        AND NOT EXISTS (
+          SELECT 1 FROM todos t
+          WHERE t.user_id = rte.user_id
+            AND t.app_todo_id = rte.app_todo_id
+            AND t.completed = FALSE
+        )
+
       ORDER BY has_time DESC, due_at ASC
     `,
     [userId, utcDayStart.toISOString(), utcDayEnd.toISOString()]
@@ -1038,8 +1053,10 @@ app.get("/remote-task-events", async (req, res) => {
 });
 
 // Desktop app calls this after importing a remote task event into local storage.
+// Optional body: { appTodoId } — links the event to the desktop todo for deduplication.
 app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
   const eventId = Number(req.params.id);
+  const appTodoId = typeof req.body?.appTodoId === "string" ? req.body.appTodoId.trim() : null;
 
   if (!Number.isInteger(eventId) || eventId <= 0) {
     return res.status(400).json({ ok: false, error: "Invalid event id." });
@@ -1049,10 +1066,11 @@ app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
     const { rowCount } = await query(
       `
         UPDATE remote_task_events
-        SET processed_by_desktop = TRUE, processed_at = NOW()
+        SET processed_by_desktop = TRUE, processed_at = NOW(),
+            app_todo_id = COALESCE($2, app_todo_id)
         WHERE id = $1 AND processed_by_desktop = FALSE
       `,
-      [eventId]
+      [eventId, appTodoId]
     );
 
     if (rowCount === 0) {
