@@ -1004,6 +1004,15 @@ async function processDueReminders() {
         );
       }
     }
+    // Clean up sent reminders older than 1 day to keep the DB lean.
+    const { rowCount: deleted } = await query(
+      `DELETE FROM reminders
+       WHERE status = 'sent'
+         AND sent_at < NOW() - INTERVAL '1 day'`
+    );
+    if (deleted > 0) {
+      console.log(`[cleanup] deleted ${deleted} old sent reminder(s)`);
+    }
   } catch (error) {
     console.error("Reminder worker error:", error);
   } finally {
