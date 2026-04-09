@@ -1086,12 +1086,15 @@ app.get("/inbox/:userId", async (req, res) => {
   try {
     const { rows } = await query(
       `
-        SELECT id, user_id, message_text, telegram_message_id, read_at, created_at
-        FROM inbox_messages
-        WHERE user_id = $1
-          ${unreadOnly ? "AND read_at IS NULL" : ""}
-        ORDER BY created_at DESC
-        LIMIT 100
+        DELETE FROM inbox_messages
+        WHERE id IN (
+          SELECT id FROM inbox_messages
+          WHERE user_id = $1
+            ${unreadOnly ? "AND read_at IS NULL" : ""}
+          ORDER BY created_at DESC
+          LIMIT 100
+        )
+        RETURNING id, user_id, message_text, telegram_message_id, read_at, created_at
       `,
       [userId]
     );
