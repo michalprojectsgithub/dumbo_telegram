@@ -1256,8 +1256,8 @@ app.post("/remote-task-events/:id/mark-processed", async (req, res) => {
 // - Deletes any pending reminder when the todo is completed, has no date, or has no time.
 async function syncReminderForTodo(client, userId, appTodoId, title, dueAt, hasTime, completed) {
   const { rows: existing } = await client.query(
-    `SELECT id FROM reminders
-     WHERE user_id = $1 AND app_todo_id = $2 AND status IN ('pending', 'sending')
+    `SELECT id, status FROM reminders
+     WHERE user_id = $1 AND app_todo_id = $2
      LIMIT 1`,
     [userId, appTodoId]
   );
@@ -1268,6 +1268,11 @@ async function syncReminderForTodo(client, userId, appTodoId, title, dueAt, hasT
     if (existing.length > 0) {
       await client.query("DELETE FROM reminders WHERE id = $1", [existing[0].id]);
     }
+    return;
+  }
+
+  // Already sent or failed — don't re-create.
+  if (existing.length > 0 && (existing[0].status === 'sent' || existing[0].status === 'failed')) {
     return;
   }
 
