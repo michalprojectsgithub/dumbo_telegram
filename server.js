@@ -24,6 +24,7 @@ if (!telegramBotToken) {
 let lastUpdateId = Number(process.env.TELEGRAM_INITIAL_UPDATE_ID || 0);
 let pollingInProgress = false;
 let workerInProgress = false;
+let habitWorkerInProgress = false;
 
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", corsOrigin);
@@ -233,9 +234,17 @@ function computeNextMorningBriefAt(timezoneOffsetMinutes) {
 }
 
 async function processHabitReminders() {
+  // Prevent overlapping runs in this process: the claim query advances next_fire_at
+  // only after sending, so a second concurrent run could re-claim and double-send.
+  if (habitWorkerInProgress) {
+    return;
+  }
+
+  habitWorkerInProgress = true;
   try {
-    // Atomically claim due habits to prevent duplicate delivery across server instances
-    const { rows } = await query(
+    try {
+      // Atomically claim due habits to prevent duplicate delivery across server instances
+      const { rows } = await query(
       `
         WITH claimed AS (
           SELECT id FROM habit_reminders
@@ -278,11 +287,17 @@ async function processHabitReminders() {
         [habit.id, nextFireAt]
       );
     }
-  } catch (error) {
-    console.error("[habits] Worker error:", error);
-  }
+    } catch (error) {
+      console.error("[habits] Worker error:", error);
+    }
 
-  await processMorningBriefs();
+    // Always run morning briefs, even if the habit loop above failed.
+    await processMorningBriefs();
+  } catch (error) {
+    console.error("[habits] Unexpected worker error:", error);
+  } finally {
+    habitWorkerInProgress = false;
+  }
 }
 
 async function processMorningBriefs() {
@@ -1086,15 +1101,12 @@ app.get("/inbox/:userId", async (req, res) => {
   try {
     const { rows } = await query(
       `
-        DELETE FROM inbox_messages
-        WHERE id IN (
-          SELECT id FROM inbox_messages
-          WHERE user_id = $1
-            ${unreadOnly ? "AND read_at IS NULL" : ""}
-          ORDER BY created_at DESC
-          LIMIT 100
-        )
-        RETURNING id, user_id, message_text, telegram_message_id, read_at, created_at
+        SELECT id, user_id, message_text, telegram_message_id, read_at, created_at
+        FROM inbox_messages
+        WHERE user_id = $1
+          ${unreadOnly ? "AND read_at IS NULL" : ""}
+        ORDER BY created_at DESC
+        LIMIT 100
       `,
       [userId]
     );
